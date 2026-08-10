@@ -1,0 +1,105 @@
+name: Build Gamino APK - Auto ZIP
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '*.zip'
+      - '**/*.zip'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gamino-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect uploaded Flutter ZIP
+        id: source
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          import os
+          import re
+          import subprocess
+          import zipfile
+          from pathlib import Path
+
+          event = os.environ.get("EVENT_NAME", "")
+          before = os.environ.get("BEFORE_SHA", "")
+          current = os.environ.get("CURRENT_SHA", "HEAD")
+          output_file = Path(os.environ["GITHUB_OUTPUT"])
+
+          def git_lines(*args):
+              result = subprocess.run(
+                  ["git", *args],
+                  text=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  check=False,
+              )
+              return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+          if event == "push":
+              if before and set(before) == {"0"}:
+                  candidates = git_lines("ls-files")
+              else:
+                  candidates = git_lines(
+                      "diff", "--name-only", "--diff-filter=AM", before, current
+                  )
+          else:
+              candidates = git_lines("ls-files")
+
+          candidates = [
+              p for p in candidates
+              if p.lower().endswith(".zip") and Path(p).is_file()
+          ]
+
+          def parse_version_key(version):
+              nums = [int(x) for x in re.findall(r"\d+", version or "")]
+              return tuple(nums + [0] * (8 - len(nums)))
+
+          valid = []
+
+          for zip_path in candidates:
+              try:
+                  with zipfile.ZipFile(zip_path) as zf:
+                      pubspecs = [
+                          n for n in zf.namelist()
+                          if n == "pubspec.yaml" or n.endswith("/pubspec.yaml")
+                      ]
+
+                      if not pubspecs:
+                          continue
+
+                      pubspec = min(
+                          pubspecs,
+                          key=lambda n: (n.count("/"), len(n))
+                      )
+
+                      text = zf.read(pubspec).decode(
+                          "utf-8",
+                          errors="replace"
+                      )
+
+                      version_match = re.search(
+
