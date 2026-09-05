@@ -1,0 +1,413 @@
+name: Build Gamino Bazaar and Myket
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '**/*.zip'
+      - '.github/workflows/build-gamino-markets.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gamino-android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-android-markets:
+    name: Build Bazaar APK+AAB and Myket APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+
+    env:
+      FLUTTER_VERSION: '3.29.3'
+      JAVA_VERSION: '21'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager \
+            "platforms;android-36" \
+            "ndk;26.3.11579264" \
+            "cmake;3.22.1"
+
+      - name: Auto-detect and verify Gamino source ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPO_ROOT="$GITHUB_WORKSPACE"
+          STATE_DIR="$REPO_ROOT/.gamino_build"
+          SOURCE_DIR="$STATE_DIR/source"
+          rm -rf "$STATE_DIR"
+          mkdir -p "$STATE_DIR"
+
+          python3 - "$REPO_ROOT" "$SOURCE_DIR" "$STATE_DIR/source_path.txt" <<'PY'
+          import shutil
+          import sys
+          import tempfile
+          import zipfile
+          from pathlib import Path, PurePosixPath
+
+          repo = Path(sys.argv[1]).resolve()
+          dest = Path(sys.argv[2]).resolve()
+          state_file = Path(sys.argv[3]).resolve()
+
+          excluded_parts = {'.git', '.gamino_build', 'build', '.dart_tool'}
+          zip_files = []
+          for p in repo.rglob('*'):
+              if not p.is_file() or p.suffix.lower() != '.zip':
+                  continue
+              try:
+                  rel_parts = p.relative_to(repo).parts
+              except ValueError:
+                  rel_parts = p.parts
+              if any(part in excluded_parts for part in rel_parts):
+                  continue
+              zip_files.append(p)
+
+          if not zip_files:
+              raise SystemExit('ERROR: No ZIP file found. Upload the Gamino Flutter source ZIP with any filename.')
+
+          required_rel = (
+              'pubspec.yaml',
+              'lib/main.dart',
+              'lib/market_billing.dart',
+              'scripts/market_billing_templates/bazaar.template',
+              'scripts/market_billing_templates/myket.template',
+              'scripts/prepare_android.py',
+              'scripts/select_market_iap.py',
+              'build_support/gamino-release-key.jks',
+              'build_support/key.properties',
+          )
+
+          candidates = []
+          checked = []
+
+          for zpath in sorted(zip_files):
+              try:
+                  with zipfile.ZipFile(zpath) as zf:
+                      raw_names = [
+                          n.replace('\\', '/').lstrip('./')
+                          for n in zf.namelist()
+                          if n and not n.endswith('/')
+                      ]
+                      names = set(raw_names)
+                      pubspecs = [n for n in raw_names if n == 'pubspec.yaml' or n.endswith('/pubspec.yaml')]
+                      matched = []
+                      for pub in pubspecs:
+                          prefix = pub[:-len('pubspec.yaml')]
+                          if all(prefix + rel in names for rel in required_rel):
+                              matched.append(prefix)
+
+                      checked.append((zpath, len(raw_names), matched))
+
+                      for prefix in matched:
+                          score = 0
+                          optional = (
+                              'android/app/build.gradle',
+                              'android/app/google-services.json',
+                              'android/app/src/main/kotlin/ir/miplus/gamino/MainActivity.kt',
+                          )
+                          score += 10 * sum(1 for rel in optional if prefix + rel in names)
+                          depth = len(PurePosixPath(prefix).parts) if prefix else 0
+                          score += max(0, 5 - depth)
+                          candidates.append((score, zpath, prefix))
+              except zipfile.BadZipFile:
+                  checked.append((zpath, -1, []))
+
+          if not candidates:
+              print('Checked ZIP files:')
+              for zpath, count, prefixes in checked:
+                  status = 'invalid ZIP' if count < 0 else f'{count} entries'
+                  print(f'  - {zpath.relative_to(repo)}: {status}')
+              raise SystemExit(
+                  'ERROR: No fixed Gamino Flutter source ZIP found. Filename can be anything, '
+                  'but the ZIP must contain the isolated Bazaar/Myket billing templates outside lib/ and selector script.'
+              )
+
+          candidates.sort(key=lambda item: (-item[0], str(item[1]), item[2]))
+          best_score = candidates[0][0]
+          best = [item for item in candidates if item[0] == best_score]
+          if len(best) != 1:
+              print('Equally valid Gamino source ZIP candidates:')
+              for score, zpath, prefix in best:
+                  print(f'  - {zpath.relative_to(repo)} :: root={prefix or "<zip-root>"} :: score={score}')
+              raise SystemExit('ERROR: More than one equally valid fixed source ZIP was found. Keep one current source ZIP.')
+
+          _, source_zip, prefix = best[0]
+          print(f'Detected source ZIP: {source_zip.relative_to(repo)}')
+          print(f'Detected project root inside ZIP: {prefix or "<zip-root>"}')
+
+          temp_dir = Path(tempfile.mkdtemp(prefix='gamino_zip_extract_'))
+          try:
+              with zipfile.ZipFile(source_zip) as zf:
+                  for info in zf.infolist():
+                      name = info.filename.replace('\\', '/')
+                      pp = PurePosixPath(name)
+                      if pp.is_absolute() or '..' in pp.parts:
+                          raise SystemExit(f'ERROR: Unsafe path in ZIP: {info.filename}')
+                  zf.extractall(temp_dir)
+
+              project_root = temp_dir / Path(prefix) if prefix else temp_dir
+              for rel in required_rel:
+                  if not (project_root / rel).is_file():
+                      raise SystemExit(f'ERROR: Required source file missing after extraction: {rel}')
+
+              pubspec = (project_root / 'pubspec.yaml').read_text(encoding='utf-8', errors='replace')
+              if 'name: gamino' not in pubspec:
+                  raise SystemExit('ERROR: Detected Flutter ZIP is not Gamino (pubspec name mismatch).')
+
+              if dest.exists():
+                  shutil.rmtree(dest)
+              shutil.copytree(project_root, dest)
+              state_file.write_text(str(dest), encoding='utf-8')
+              print(f'Gamino source extracted and verified at: {dest}')
+          finally:
+              shutil.rmtree(temp_dir, ignore_errors=True)
+          PY
+
+          test -s "$STATE_DIR/source_path.txt"
+          SOURCE_DIR="$(cat "$STATE_DIR/source_path.txt")"
+          test -f "$SOURCE_DIR/scripts/select_market_iap.py"
+          echo "SOURCE_DIR=$SOURCE_DIR"
+
+      - name: Prepare Android market flavors
+        shell: bash
+        run: |
+          set -euo pipefail
+          SOURCE_DIR="$(cat "$GITHUB_WORKSPACE/.gamino_build/source_path.txt")"
+          cd "$SOURCE_DIR"
+
+          flutter --version
+          java -version
+
+          SCAFFOLD_DIR="$RUNNER_TEMP/gamino-android-wrapper"
+          rm -rf "$SCAFFOLD_DIR"
+          flutter create \
+            --platforms=android \
+            --org ir.miplus \
+            --project-name gamino \
+            --no-pub \
+            "$SCAFFOLD_DIR"
+
+          mkdir -p android/gradle/wrapper android/app
+          cp "$SCAFFOLD_DIR/android/gradle/wrapper/gradle-wrapper.jar" android/gradle/wrapper/gradle-wrapper.jar
+          cp "$SCAFFOLD_DIR/android/gradlew" android/gradlew
+          cp "$SCAFFOLD_DIR/android/gradlew.bat" android/gradlew.bat
+          chmod +x android/gradlew
+
+          cat > android/gradle/wrapper/gradle-wrapper.properties <<'EOF'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.7-bin.zip
+          networkTimeout=10000
+          validateDistributionUrl=true
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          EOF
+
+          cp build_support/gamino-release-key.jks android/app/gamino-release-key.jks
+          cp build_support/key.properties android/key.properties
+          python3 scripts/prepare_android.py
+          rm -rf "$SCAFFOLD_DIR"
+
+          grep -q 'version "2.1.10"' android/settings.gradle
+          grep -Eq 'compileSdk[[:space:]]*=[[:space:]]*36' android/app/build.gradle
+          grep -q 'flavorDimensions "market"' android/app/build.gradle
+          grep -q 'bazaar {' android/app/build.gradle
+          grep -q 'myket {' android/app/build.gradle
+          grep -q 'BuildConfig.GAMINO_MARKET' android/app/src/main/kotlin/ir/miplus/gamino/MainActivity.kt
+
+      - name: Select Bazaar billing only
+        shell: bash
+        run: |
+          set -euo pipefail
+          SOURCE_DIR="$(cat "$GITHUB_WORKSPACE/.gamino_build/source_path.txt")"
+          cd "$SOURCE_DIR"
+          rm -rf .dart_tool build android/.gradle
+          python3 scripts/select_market_iap.py bazaar
+          flutter pub get
+
+          grep -q '^  flutter_poolakey: 2.2.0+1.0.0$' pubspec.yaml
+          ! grep -q '^  myket_iap:' pubspec.yaml
+          test ! -e lib/market_billing_bazaar.dart
+          test ! -e lib/market_billing_myket.dart
+          grep -q "const String gaminoMarket = 'bazaar';" lib/market_billing.dart
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          data = json.loads(Path('.flutter-plugins-dependencies').read_text(encoding='utf-8'))
+          names = {item['name'] for item in data.get('plugins', {}).get('android', [])}
+          assert 'flutter_poolakey' in names, names
+          assert 'myket_iap' not in names, names
+          print('Bazaar plugin isolation verified:', sorted(names))
+          PY
+
+      - name: Analyze Bazaar source
+        shell: bash
+        run: |
+          set -euo pipefail
+          SOURCE_DIR="$(cat "$GITHUB_WORKSPACE/.gamino_build/source_path.txt")"
+          cd "$SOURCE_DIR"
+          flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Build Bazaar APK
+        shell: bash
+        env:
+          BAZAAR_RSA: MIHNMA0GCSqGSIb3DQEBAQUAA4G7ADCBtwKBrwDM49ZZFHAsH77T6aGoAGuCcdBeDENn74uQud2ni3py6wey+4gPOZvjAv1610N24kGM69LXwEkLZdqQCDAroC8sB3leUf0aYeSqaULqCcIgeZ23jPriHVmtW6ZXp4HKX8nOtAJZS9j43DzZ4lP0i0vTKDMHfWTxZkRanf7MrRXxhkYAvkSEXhQRZMs/pVK/YQQHe2w/1CH17eLfUKNlqrKAp80V9vgmtOIubE5PIFcCAwEAAQ==
+        run: |
+          set -euo pipefail
+          SOURCE_DIR="$(cat "$GITHUB_WORKSPACE/.gamino_build/source_path.txt")"
+          cd "$SOURCE_DIR"
+          mkdir -p "$GITHUB_WORKSPACE/build/market-artifacts"
+
+          flutter build apk \
+            --release \
+            --flavor bazaar \
+            --no-pub \
+            --no-shrink \
+            --android-skip-build-dependency-validation \
+            --dart-define=GAMINO_MARKET=bazaar \
+            --dart-define="GAMINO_MARKET_RSA=$BAZAAR_RSA"
+
+          APK="$(find build/app/outputs -type f -name 'app-bazaar-release.apk' -print -quit)"
+          test -n "$APK" && test -s "$APK"
+          cp "$APK" "$GITHUB_WORKSPACE/build/market-artifacts/gamino-1.0.0-bazaar.apk"
+
+      - name: Build Bazaar AAB
+        shell: bash
+        env:
+          BAZAAR_RSA: MIHNMA0GCSqGSIb3DQEBAQUAA4G7ADCBtwKBrwDM49ZZFHAsH77T6aGoAGuCcdBeDENn74uQud2ni3py6wey+4gPOZvjAv1610N24kGM69LXwEkLZdqQCDAroC8sB3leUf0aYeSqaULqCcIgeZ23jPriHVmtW6ZXp4HKX8nOtAJZS9j43DzZ4lP0i0vTKDMHfWTxZkRanf7MrRXxhkYAvkSEXhQRZMs/pVK/YQQHe2w/1CH17eLfUKNlqrKAp80V9vgmtOIubE5PIFcCAwEAAQ==
+        run: |
+          set -euo pipefail
+          SOURCE_DIR="$(cat "$GITHUB_WORKSPACE/.gamino_build/source_path.txt")"
+          cd "$SOURCE_DIR"
+
+          flutter build appbundle \
+            --release \
+            --flavor bazaar \
+            --no-pub \
+            --no-shrink \
+            --android-skip-build-dependency-validation \
+            --dart-define=GAMINO_MARKET=bazaar \
+            --dart-define="GAMINO_MARKET_RSA=$BAZAAR_RSA"
+
+          AAB="$(find build/app/outputs -type f -name 'app-bazaar-release.aab' -print -quit)"
+          test -n "$AAB" && test -s "$AAB"
+          cp "$AAB" "$GITHUB_WORKSPACE/build/market-artifacts/gamino-1.0.0-bazaar.aab"
+
+      - name: Select Myket billing only
+        shell: bash
+        run: |
+          set -euo pipefail
+          SOURCE_DIR="$(cat "$GITHUB_WORKSPACE/.gamino_build/source_path.txt")"
+          cd "$SOURCE_DIR"
+
+          # Remove all Bazaar build/package state before changing the active plugin.
+          rm -rf .dart_tool build android/.gradle
+          python3 scripts/select_market_iap.py myket
+          flutter pub get
+
+          grep -q '^  myket_iap: 1.1.12$' pubspec.yaml
+          ! grep -q '^  flutter_poolakey:' pubspec.yaml
+          test ! -e lib/market_billing_bazaar.dart
+          test ! -e lib/market_billing_myket.dart
+          grep -q "const String gaminoMarket = 'myket';" lib/market_billing.dart
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          data = json.loads(Path('.flutter-plugins-dependencies').read_text(encoding='utf-8'))
+          names = {item['name'] for item in data.get('plugins', {}).get('android', [])}
+          assert 'myket_iap' in names, names
+          assert 'flutter_poolakey' not in names, names
+          print('Myket plugin isolation verified:', sorted(names))
+          PY
+
+      - name: Analyze Myket source
+        shell: bash
+        run: |
+          set -euo pipefail
+          SOURCE_DIR="$(cat "$GITHUB_WORKSPACE/.gamino_build/source_path.txt")"
+          cd "$SOURCE_DIR"
+          flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Build Myket APK
+        shell: bash
+        env:
+          MYKET_RSA: MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCCSSGCTiDEcA6ZwoCK1eLgrCLEMZ4t1puQtZ0qpqg7YfhIMPiFLuJuBu1ccNLrBvigWp8FDj4+GXDhxdP4WzthmmaHqzCp3xhbQtbX8b0ZRkq/MPAf4tVJ3NmovxtXdGyZ3Qkggy8w7dmWfD5ouft2Y2RR9fPd6LmlvQcSjiLMVwIDAQAB
+        run: |
+          set -euo pipefail
+          SOURCE_DIR="$(cat "$GITHUB_WORKSPACE/.gamino_build/source_path.txt")"
+          cd "$SOURCE_DIR"
+
+          flutter build apk \
+            --release \
+            --flavor myket \
+            --no-pub \
+            --no-shrink \
+            --android-skip-build-dependency-validation \
+            --dart-define=GAMINO_MARKET=myket \
+            --dart-define="GAMINO_MARKET_RSA=$MYKET_RSA"
+
+          APK="$(find build/app/outputs -type f -name 'app-myket-release.apk' -print -quit)"
+          test -n "$APK" && test -s "$APK"
+          cp "$APK" "$GITHUB_WORKSPACE/build/market-artifacts/gamino-1.0.0-myket.apk"
+
+      - name: Verify exactly three release files
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIR="$GITHUB_WORKSPACE/build/market-artifacts"
+          test -s "$DIR/gamino-1.0.0-bazaar.apk"
+          test -s "$DIR/gamino-1.0.0-bazaar.aab"
+          test -s "$DIR/gamino-1.0.0-myket.apk"
+          COUNT="$(find "$DIR" -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          test "$COUNT" = "3"
+          ls -lh "$DIR"
+
+      - name: Upload Bazaar APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: gamino-1.0.0-bazaar-apk
+          path: build/market-artifacts/gamino-1.0.0-bazaar.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Bazaar AAB
+        uses: actions/upload-artifact@v4
+        with:
+          name: gamino-1.0.0-bazaar-aab
+          path: build/market-artifacts/gamino-1.0.0-bazaar.aab
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Myket APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: gamino-1.0.0-myket-apk
+          path: build/market-artifacts/gamino-1.0.0-myket.apk
+          if-no-files-found: error
+          retention-days: 14
